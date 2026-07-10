@@ -1,27 +1,21 @@
-# ESPNcricinfo Ducks Extractor
-# Creates 4 separate CSV files:
+# ESPNcricinfo Ducks Extractor - FIXED VERSION
+#
+# Creates:
 #   output/t20_ducks.csv
 #   output/test_ducks.csv
 #   output/odi_ducks.csv
 #   output/t20i_ducks.csv
-#
-# Required output format:
-#   cricinfo_id,name,ducks
-#
-# Also creates:
 #   output/ducks_report.csv
 #
-# Report columns:
-#   format,cricinfo_class,total_players,non_zero_ducks,zero_ducks,output_file
+# Ducks CSV format:
+#   cricinfo_id,name,ducks
+#
+# This version avoids dplyr table-name errors by parsing ESPN rows manually.
 
 required_packages <- c(
   "httr2",
-  "rvest",
-  "dplyr",
-  "purrr",
-  "readr",
-  "stringr",
-  "tibble"
+  "xml2",
+  "stringr"
 )
 
 install_if_missing <- function(packages) {
@@ -35,21 +29,15 @@ install_if_missing <- function(packages) {
 install_if_missing(required_packages)
 
 library(httr2)
-library(rvest)
-library(dplyr)
-library(purrr)
-library(readr)
+library(xml2)
 library(stringr)
-library(tibble)
 
 base_url <- "https://stats.espncricinfo.com/ci/engine/stats/index.html"
 
-formats <- tibble::tribble(
-  ~format, ~cricinfo_class,
-  "t20",   6,   # all T20 / Twenty20
-  "test",  1,   # Test
-  "odi",   2,   # ODI
-  "t20i",  3    # T20I
+formats <- data.frame(
+  format = c("t20", "test", "odi", "t20i"),
+  cricinfo_class = c(6, 1, 2, 3),
+  stringsAsFactors = FALSE
 )
 
 output_dir <- "output"
@@ -89,122 +77,160 @@ fetch_html <- function(url) {
   resp <- req_perform(req)
   html <- resp_body_string(resp)
 
-  html_lower <- str_to_lower(html)
+  html_lower <- tolower(html)
 
-  if (str_detect(html_lower, "access denied")) {
+  if (grepl("access denied", html_lower, fixed = TRUE)) {
     stop("ESPNcricinfo returned Access Denied for: ", url)
   }
 
-  if (str_detect(html_lower, "this page is under maintenance")) {
+  if (grepl("this page is under maintenance", html_lower, fixed = TRUE)) {
     stop("ESPNcricinfo returned 'This Page is under maintenance' for: ", url)
   }
 
   html
 }
 
-extract_player_id <- function(href) {
-  id <- str_match(href, "/(?:player|cricketers)/(\\d+)(?:\\.html)?")[, 2]
-
-  ifelse(
-    is.na(id),
-    str_match(href, "/(\\d+)\\.html")[, 2],
-    id
-  )
+clean_text <- function(x) {
+  x <- gsub("\u00a0", " ", x, fixed = TRUE)
+  x <- gsub("[[:space:]]+", " ", x)
+  trimws(x)
 }
 
-clean_player_name <- function(name) {
-  name |>
-    str_replace("\\s*\\([^)]*\\)\\s*$", "") |>
-    str_squish()
+clean_player_name <- function(x) {
+  x <- clean_text(x)
+  x <- sub("\\s*\\([^)]*\\)\\s*$", "", x)
+  clean_text(x)
+}
+
+extract_player_id <- function(href) {
+  if (is.na(href) || href == "") {
+    return(NA_character_)
+  }
+
+  id <- str_match(
+    href,
+    "/(?:player|cricketers)/(?:[^/]*-)?([0-9]+)(?:\\.html)?"
+  )[, 2]
+
+  if (is.na(id)) {
+    id <- str_match(href, "([0-9]+)\\.html")[, 2]
+  }
+
+  id
+}
+
+get_cell_texts <- function(row, tag) {
+  cells <- xml_find_all(row, paste0(".//", tag))
+  clean_text(xml_text(cells))
+}
+
+parse_one_table <- function(tbl) {
+  header_rows <- xml_find_all(tbl, ".//tr[th]")
+
+  if (length(header_rows) == 0) {
+    return(NULL)
+  }
+
+  header <- NULL
+
+  for (hr in header_rows) {
+    h <- get_cell_texts(hr, "th")
+
+    if ("Player" %in% h && any(h %in% c("0", "Ducks"))) {
+      header <- h
+      break
+    }
+  }
+
+  if (is.null(header)) {
+    return(NULL)
+  }
+
+  player_index <- which(header == "Player")[1]
+  duck_index <- which(header %in% c("0", "Ducks"))[1]
+
+  if (is.na(player_index) || is.na(duck_index)) {
+    return(NULL)
+  }
+
+  data_rows <- xml_find_all(tbl, ".//tr[td]")
+
+  output <- data.frame(
+    cricinfo_id = character(),
+    name = character(),
+    ducks = integer(),
+    stringsAsFactors = FALSE
+  )
+
+  for (row in data_rows) {
+    cells <- xml_find_all(row, ".//td")
+    texts <- clean_text(xml_text(cells))
+
+    if (length(texts) < max(player_index, duck_index)) {
+      next
+    }
+
+    player_name <- clean_player_name(texts[player_index])
+    duck_value <- suppressWarnings(
+      as.integer(gsub(",", "", texts[duck_index]))
+    )
+
+    if (is.na(player_name) || player_name == "" || tolower(player_name) == "player") {
+      next
+    }
+
+    if (is.na(duck_value)) {
+      next
+    }
+
+    first_cell_link <- xml_find_first(cells[player_index], ".//a")
+    href <- xml_attr(first_cell_link, "href")
+    cricinfo_id <- extract_player_id(href)
+
+    if (is.na(cricinfo_id) || cricinfo_id == "") {
+      next
+    }
+
+    output <- rbind(
+      output,
+      data.frame(
+        cricinfo_id = cricinfo_id,
+        name = player_name,
+        ducks = duck_value,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  if (nrow(output) == 0) {
+    return(NULL)
+  }
+
+  output
 }
 
 parse_stats_table <- function(html) {
   page <- read_html(html)
 
-  tables <- page |> html_elements("table.engineTable")
+  tables <- xml_find_all(page, ".//table[contains(@class, 'engineTable')]")
 
   if (length(tables) == 0) {
-    tables <- page |> html_elements("table")
+    tables <- xml_find_all(page, ".//table")
   }
 
   for (tbl in tables) {
-    table_df <- tryCatch(
-      tbl |> html_table(fill = TRUE),
-      error = function(e) NULL
-    )
+    parsed <- parse_one_table(tbl)
 
-    if (is.null(table_df) || nrow(table_df) == 0) {
-      next
-    }
-
-    names(table_df) <- names(table_df) |>
-      str_replace_all("\\s+", " ") |>
-      str_trim()
-
-    if (!("Player" %in% names(table_df))) {
-      next
-    }
-
-    duck_col <- names(table_df)[names(table_df) %in% c("0", "Ducks")]
-
-    if (length(duck_col) == 0) {
-      next
-    }
-
-    data_rows <- tbl |> html_elements("tr.data1, tr.data2")
-
-    if (length(data_rows) == 0) {
-      all_rows <- tbl |> html_elements("tr")
-
-      data_rows <- all_rows[
-        map_lgl(all_rows, function(row) {
-          cells <- row |> html_elements("td")
-          has_cells <- length(cells) > 0
-          has_player_link <- length(row |> html_elements("td:first-child a")) > 0
-          has_cells && has_player_link
-        })
-      ]
-    }
-
-    player_links <- data_rows |>
-      map_chr(function(row) {
-        link <- row |> html_element("td:first-child a")
-        href <- link |> html_attr("href")
-
-        ifelse(is.na(href), NA_character_, href)
-      })
-
-    player_ids <- extract_player_id(player_links)
-
-    cleaned <- table_df |>
-      filter(!is.na(Player)) |>
-      mutate(Player = str_squish(as.character(Player))) |>
-      filter(Player != "") |>
-      filter(str_to_lower(Player) != "player") |>
-      mutate(
-        row_number_clean = row_number(),
-        cricinfo_id = player_ids[row_number_clean],
-        name = clean_player_name(Player),
-        ducks = suppressWarnings(
-          as.integer(str_replace_all(as.character(.data[[duck_col[1]]]), ",", ""))
-        )
-      ) |>
-      select(cricinfo_id, name, ducks) |>
-      filter(!is.na(cricinfo_id)) |>
-      filter(!is.na(name), name != "") |>
-      filter(!is.na(ducks)) |>
-      distinct(cricinfo_id, .keep_all = TRUE) |>
-      arrange(desc(ducks), name)
-
-    if (nrow(cleaned) > 0) {
-      return(cleaned)
+    if (!is.null(parsed) && nrow(parsed) > 0) {
+      return(parsed)
     }
   }
 
-  tibble(
+  data.frame(
     cricinfo_id = character(),
     name = character(),
-    ducks = integer()
+    ducks = integer(),
+    stringsAsFactors = FALSE
   )
 }
 
@@ -218,7 +244,6 @@ extract_one_format <- function(format_name, class_id, size = 200, max_pages = 50
 
   for (page_num in seq_len(max_pages)) {
     url <- build_url(class_id, page_num, size)
-
     html <- fetch_html(url)
     page_data <- parse_stats_table(html)
 
@@ -229,12 +254,7 @@ extract_one_format <- function(format_name, class_id, size = 200, max_pages = 50
 
     all_pages[[length(all_pages) + 1]] <- page_data
 
-    message(
-      "[", format_name, "] page ",
-      page_num,
-      " rows: ",
-      nrow(page_data)
-    )
+    message("[", format_name, "] page ", page_num, " rows: ", nrow(page_data))
 
     if (nrow(page_data) < size) {
       message("[", format_name, "] final page reached.")
@@ -248,21 +268,26 @@ extract_one_format <- function(format_name, class_id, size = 200, max_pages = 50
     stop("No data extracted for format: ", format_name)
   }
 
-  out <- bind_rows(all_pages) |>
-    distinct(cricinfo_id, .keep_all = TRUE) |>
-    arrange(desc(ducks), name)
+  out <- do.call(rbind, all_pages)
+
+  out <- out[!duplicated(out$cricinfo_id), ]
+
+  out <- out[order(-out$ducks, out$name), ]
+
+  out <- out[, c("cricinfo_id", "name", "ducks")]
 
   out_file <- file.path(output_dir, paste0(format_name, "_ducks.csv"))
 
-  readr::write_csv(out, out_file, na = "")
+  write.csv(out, out_file, row.names = FALSE, na = "")
 
-  report_row <- tibble(
+  report_row <- data.frame(
     format = format_name,
     cricinfo_class = class_id,
     total_players = nrow(out),
     non_zero_ducks = sum(out$ducks > 0, na.rm = TRUE),
     zero_ducks = sum(out$ducks == 0, na.rm = TRUE),
-    output_file = out_file
+    output_file = out_file,
+    stringsAsFactors = FALSE
   )
 
   message("")
@@ -280,12 +305,9 @@ extract_one_format <- function(format_name, class_id, size = 200, max_pages = 50
 all_reports <- list()
 
 for (i in seq_len(nrow(formats))) {
-  format_name <- formats$format[i]
-  class_id <- formats$cricinfo_class[i]
-
   result <- extract_one_format(
-    format_name = format_name,
-    class_id = class_id,
+    format_name = formats$format[i],
+    class_id = formats$cricinfo_class[i],
     size = 200,
     max_pages = 500,
     sleep_seconds = 1
@@ -294,10 +316,11 @@ for (i in seq_len(nrow(formats))) {
   all_reports[[length(all_reports) + 1]] <- result$report
 }
 
-report <- bind_rows(all_reports)
+report <- do.call(rbind, all_reports)
 
 report_file <- file.path(output_dir, "ducks_report.csv")
-readr::write_csv(report, report_file, na = "")
+
+write.csv(report, report_file, row.names = FALSE, na = "")
 
 message("")
 message("====================================")
