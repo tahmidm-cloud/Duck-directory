@@ -1,4 +1,4 @@
-# ESPNcricinfo Ducks Extractor - FIXED VERSION
+# ESPNcricinfo Ducks Extractor - FULL FIXED VERSION
 #
 # Creates:
 #   output/t20_ducks.csv
@@ -7,10 +7,12 @@
 #   output/t20i_ducks.csv
 #   output/ducks_report.csv
 #
-# Ducks CSV format:
+# Each ducks CSV format:
 #   cricinfo_id,name,ducks
 #
-# This version avoids dplyr table-name errors by parsing ESPN rows manually.
+# Important fix:
+#   ESPN shows "-" for players with zero ducks.
+#   This script converts "-" to 0 instead of skipping the player.
 
 required_packages <- c(
   "httr2",
@@ -119,6 +121,23 @@ extract_player_id <- function(href) {
   id
 }
 
+parse_duck_value <- function(x) {
+  duck_raw <- clean_text(x)
+  duck_raw <- gsub(",", "", duck_raw)
+
+  if (is.na(duck_raw) || duck_raw == "" || duck_raw == "-") {
+    return(0L)
+  }
+
+  duck_value <- suppressWarnings(as.integer(duck_raw))
+
+  if (is.na(duck_value)) {
+    return(NA_integer_)
+  }
+
+  duck_value
+}
+
 get_cell_texts <- function(row, tag) {
   cells <- xml_find_all(row, paste0(".//", tag))
   clean_text(xml_text(cells))
@@ -171,9 +190,7 @@ parse_one_table <- function(tbl) {
     }
 
     player_name <- clean_player_name(texts[player_index])
-    duck_value <- suppressWarnings(
-      as.integer(gsub(",", "", texts[duck_index]))
-    )
+    duck_value <- parse_duck_value(texts[duck_index])
 
     if (is.na(player_name) || player_name == "" || tolower(player_name) == "player") {
       next
@@ -244,6 +261,7 @@ extract_one_format <- function(format_name, class_id, size = 200, max_pages = 50
 
   for (page_num in seq_len(max_pages)) {
     url <- build_url(class_id, page_num, size)
+
     html <- fetch_html(url)
     page_data <- parse_stats_table(html)
 
