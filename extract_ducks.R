@@ -1,16 +1,24 @@
-# ESPNcricinfo Test Match Maidens Extractor
+# ESPNcricinfo Match-by-Match Maidens Extractor
 #
-# Source:
+# Extracts bowling maidens from Statsguru match view.
+#
+# Formats:
+#   Test = class 1
+#   ODI  = class 2
+#   T20I = class 3
+#   T20  = class 6
+#
+# Source pattern:
 # https://stats.espncricinfo.com/ci/engine/stats/index.html?class=1;template=results;type=bowling;view=match
 #
-# This extracts match-by-match bowling rows, then aggregates total maidens
-# for each unique player.
-#
-# Creates:
+# Output files:
 #   output/test_maidens.csv
+#   output/odi_maidens.csv
+#   output/t20i_maidens.csv
+#   output/t20_maidens.csv
 #   output/maidens_report.csv
 #
-# test_maidens.csv format:
+# Each maidens file:
 #   cricinfo_id,name,maidens
 
 required_packages <- c(
@@ -35,13 +43,19 @@ library(stringr)
 
 base_url <- "https://stats.espncricinfo.com/ci/engine/stats/index.html"
 
+formats <- data.frame(
+  format = c("test", "odi", "t20i", "t20"),
+  cricinfo_class = c(1, 2, 3, 6),
+  stringsAsFactors = FALSE
+)
+
 output_dir <- "output"
 dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
-build_url <- function(page, size = 200) {
+build_url <- function(class_id, page, size = 200) {
   paste0(
     base_url,
-    "?class=1",
+    "?class=", class_id,
     ";page=", page,
     ";size=", size,
     ";template=results",
@@ -66,7 +80,7 @@ fetch_html <- function(url) {
       `Accept-Language` = "en-US,en;q=0.9",
       Connection = "close"
     ) |>
-    req_timeout(45) |>
+    req_timeout(60) |>
     req_retry(max_tries = 3)
 
   resp <- req_perform(req)
@@ -206,8 +220,9 @@ parse_one_table <- function(tbl) {
       next
     }
 
-    first_cell_link <- xml_find_first(cells[player_index], ".//a")
-    href <- xml_attr(first_cell_link, "href")
+    player_cell <- cells[player_index]
+    player_link <- xml_find_first(player_cell, ".//a")
+    href <- xml_attr(player_link, "href")
     cricinfo_id <- extract_player_id(href)
 
     if (is.na(cricinfo_id) || cricinfo_id == "") {
@@ -257,31 +272,31 @@ parse_stats_table <- function(html) {
   )
 }
 
-extract_all_match_rows <- function(size = 200, max_pages = 1000, sleep_seconds = 1) {
+extract_match_rows_for_format <- function(format_name, class_id, size = 200, max_pages = 10000, sleep_seconds = 1) {
   message("")
   message("====================================")
-  message("Extracting TEST match-by-match maidens")
+  message("Extracting ", toupper(format_name), " match-by-match bowling maidens")
   message("====================================")
 
   all_pages <- list()
 
   for (page_num in seq_len(max_pages)) {
-    url <- build_url(page_num, size)
+    url <- build_url(class_id, page_num, size)
 
     html <- fetch_html(url)
     page_data <- parse_stats_table(html)
 
     if (nrow(page_data) == 0) {
-      message("[test] no more rows found. Stopping.")
+      message("[", format_name, "] no more rows found. Stopping.")
       break
     }
 
     all_pages[[length(all_pages) + 1]] <- page_data
 
-    message("[test] page ", page_num, " match rows: ", nrow(page_data))
+    message("[", format_name, "] page ", page_num, " match rows: ", nrow(page_data))
 
     if (nrow(page_data) < size) {
-      message("[test] final page reached.")
+      message("[", format_name, "] final page reached.")
       break
     }
 
@@ -289,7 +304,7 @@ extract_all_match_rows <- function(size = 200, max_pages = 1000, sleep_seconds =
   }
 
   if (length(all_pages) == 0) {
-    stop("No match-by-match bowling rows extracted.")
+    stop("No match-by-match bowling rows extracted for: ", format_name)
   }
 
   do.call(rbind, all_pages)
@@ -327,28 +342,48 @@ aggregate_maidens_by_player <- function(match_rows) {
   output[, c("cricinfo_id", "name", "maidens")]
 }
 
-match_rows <- extract_all_match_rows(
-  size = 200,
-  max_pages = 1000,
-  sleep_seconds = 1
-)
+all_reports <- list()
 
-aggregated <- aggregate_maidens_by_player(match_rows)
+for (i in seq_len(nrow(formats))) {
+  format_name <- formats$format[i]
+  class_id <- formats$cricinfo_class[i]
 
-maidens_file <- file.path(output_dir, "test_maidens.csv")
-write.csv(aggregated, maidens_file, row.names = FALSE, na = "")
+  match_rows <- extract_match_rows_for_format(
+    format_name = format_name,
+    class_id = class_id,
+    size = 200,
+    max_pages = 10000,
+    sleep_seconds = 1
+  )
 
-report <- data.frame(
-  format = "test",
-  cricinfo_class = 1,
-  source_view = "match",
-  total_match_rows = nrow(match_rows),
-  unique_players = nrow(aggregated),
-  non_zero_maidens_players = sum(aggregated$maidens > 0, na.rm = TRUE),
-  zero_maidens_players = sum(aggregated$maidens == 0, na.rm = TRUE),
-  output_file = maidens_file,
-  stringsAsFactors = FALSE
-)
+  aggregated <- aggregate_maidens_by_player(match_rows)
+
+  maidens_file <- file.path(output_dir, paste0(format_name, "_maidens.csv"))
+  write.csv(aggregated, maidens_file, row.names = FALSE, na = "")
+
+  report_row <- data.frame(
+    format = format_name,
+    cricinfo_class = class_id,
+    source_view = "match",
+    total_match_rows = nrow(match_rows),
+    unique_players = nrow(aggregated),
+    non_zero_maidens_players = sum(aggregated$maidens > 0, na.rm = TRUE),
+    zero_maidens_players = sum(aggregated$maidens == 0, na.rm = TRUE),
+    output_file = maidens_file,
+    stringsAsFactors = FALSE
+  )
+
+  all_reports[[length(all_reports) + 1]] <- report_row
+
+  message("")
+  message("[", format_name, "] saved: ", maidens_file)
+  message("[", format_name, "] total match rows: ", report_row$total_match_rows)
+  message("[", format_name, "] unique players: ", report_row$unique_players)
+  message("[", format_name, "] non-zero maiden players: ", report_row$non_zero_maidens_players)
+  message("[", format_name, "] zero maiden players: ", report_row$zero_maidens_players)
+}
+
+report <- do.call(rbind, all_reports)
 
 report_file <- file.path(output_dir, "maidens_report.csv")
 write.csv(report, report_file, row.names = FALSE, na = "")
@@ -358,7 +393,10 @@ message("====================================")
 message("DONE")
 message("====================================")
 message("Created files:")
-message("  ", maidens_file)
+message("  ", file.path(output_dir, "test_maidens.csv"))
+message("  ", file.path(output_dir, "odi_maidens.csv"))
+message("  ", file.path(output_dir, "t20i_maidens.csv"))
+message("  ", file.path(output_dir, "t20_maidens.csv"))
 message("  ", report_file)
 message("")
 
