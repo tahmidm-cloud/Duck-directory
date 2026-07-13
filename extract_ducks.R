@@ -1,23 +1,31 @@
-# ESPNcricinfo Match-by-Match Maidens Extractor
+# ESPNcricinfo Parallel Match-by-Match Maidens Extractor
 #
-# This script extracts bowling maidens from ESPN Statsguru match view,
-# then aggregates maidens by unique player.
+# Parallel design:
+#   GitHub Actions runs 10 workers at the same time.
+#   Each worker extracts every 10th page.
+#   Final merge job combines all worker CSVs and aggregates maidens by player.
 #
-# GitHub Actions passes:
-#   FORMAT = test / odi / t20i / t20
-#   CLASS_ID = 1 / 2 / 3 / 6
+# Formats:
+#   Test = class 1
+#   ODI  = class 2
+#   T20I = class 3
+#   T20  = class 6
 #
-# Source pattern:
-# https://stats.espncricinfo.com/ci/engine/stats/index.html?class=1;template=results;type=bowling;view=match
-#
-# Output per job:
+# Final output:
 #   output/test_maidens.csv
-#   output/test_maidens_report.csv
+#   output/odi_maidens.csv
+#   output/t20i_maidens.csv
+#   output/t20_maidens.csv
+#   output/maidens_report.csv
 #
-# Main CSV format:
+# Each final maidens file:
 #   cricinfo_id,name,maidens
 
-required_packages <- c("xml2")
+required_packages <- c(
+  "httr2",
+  "xml2",
+  "stringr"
+)
 
 install_if_missing <- function(packages) {
   missing <- packages[!packages %in% rownames(installed.packages())]
@@ -29,21 +37,38 @@ install_if_missing <- function(packages) {
 
 install_if_missing(required_packages)
 
+library(httr2)
 library(xml2)
+library(stringr)
 
 base_url <- "https://stats.espncricinfo.com/ci/engine/stats/index.html"
 
-format_name <- Sys.getenv("FORMAT")
-class_id_raw <- Sys.getenv("CLASS_ID")
-
-if (format_name == "" || class_id_raw == "") {
-  stop("Missing FORMAT or CLASS_ID. The GitHub workflow must pass these environment variables.")
-}
-
-class_id <- as.integer(class_id_raw)
+formats <- data.frame(
+  format = c("test", "odi", "t20i", "t20"),
+  cricinfo_class = c(1, 2, 3, 6),
+  stringsAsFactors = FALSE
+)
 
 output_dir <- "output"
+raw_dir <- file.path(output_dir, "raw")
+
 dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+
+get_env_int <- function(name, default_value) {
+  value <- Sys.getenv(name, unset = as.character(default_value))
+  suppressWarnings(as.integer(value))
+}
+
+mode <- Sys.getenv("MODE", unset = "worker")
+
+worker_id <- get_env_int("WORKER_ID", 1)
+total_workers <- get_env_int("TOTAL_WORKERS", 10)
+max_pages <- get_env_int("MAX_PAGES", 10000)
+page_size <- get_env_int("PAGE_SIZE", 200)
+empty_limit <- get_env_int("EMPTY_LIMIT", 3)
+
+artifact_dir <- Sys.getenv("ARTIFACT_DIR", unset = "artifacts")
 
 build_url <- function(class_id, page, size = 200) {
   paste0(
@@ -60,35 +85,24 @@ build_url <- function(class_id, page, size = 200) {
 fetch_html <- function(url) {
   message("Reading: ", url)
 
-  tmp <- tempfile(fileext = ".html")
+  req <- request(url) |>
+    req_user_agent(
+      paste(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "AppleWebKit/537.36 (KHTML, like Gecko)",
+        "Chrome/126.0 Safari/537.36"
+      )
+    ) |>
+    req_headers(
+      Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      `Accept-Language` = "en-US,en;q=0.9",
+      Connection = "close"
+    ) |>
+    req_timeout(60) |>
+    req_retry(max_tries = 3)
 
-  user_agent <- paste(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "AppleWebKit/537.36 (KHTML, like Gecko)",
-    "Chrome/126.0 Safari/537.36"
-  )
-
-  args <- c(
-    "-L",
-    "--fail",
-    "--silent",
-    "--show-error",
-    "--max-time", "60",
-    "-A", user_agent,
-    "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "-H", "Accept-Language: en-US,en;q=0.9",
-    url,
-    "-o", tmp
-  )
-
-  status <- system2("curl", args = args)
-
-  if (!is.null(status) && status != 0) {
-    stop("curl failed for: ", url)
-  }
-
-  html <- paste(readLines(tmp, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
-  unlink(tmp)
+  resp <- req_perform(req)
+  html <- resp_body_string(resp)
 
   html_lower <- tolower(html)
 
@@ -120,23 +134,16 @@ extract_player_id <- function(href) {
     return(NA_character_)
   }
 
-  pattern1 <- "/(?:player|cricketers)/(?:[^/]*-)?([0-9]+)(?:\\.html)?"
-  match1 <- regexec(pattern1, href, perl = TRUE)
-  result1 <- regmatches(href, match1)
+  id <- str_match(
+    href,
+    "/(?:player|cricketers)/(?:[^/]*-)?([0-9]+)(?:\\.html)?"
+  )[, 2]
 
-  if (length(result1[[1]]) >= 2) {
-    return(result1[[1]][2])
+  if (is.na(id)) {
+    id <- str_match(href, "([0-9]+)\\.html")[, 2]
   }
 
-  pattern2 <- "([0-9]+)\\.html"
-  match2 <- regexec(pattern2, href, perl = TRUE)
-  result2 <- regmatches(href, match2)
-
-  if (length(result2[[1]]) >= 2) {
-    return(result2[[1]][2])
-  }
-
-  NA_character_
+  id
 }
 
 parse_number_value <- function(x) {
@@ -205,9 +212,12 @@ parse_one_table <- function(tbl) {
 
   data_rows <- xml_find_all(tbl, ".//tr[td]")
 
-  cricinfo_ids <- character()
-  names_vec <- character()
-  maidens_vec <- integer()
+  output <- data.frame(
+    cricinfo_id = character(),
+    name = character(),
+    maidens = integer(),
+    stringsAsFactors = FALSE
+  )
 
   for (row in data_rows) {
     cells <- xml_find_all(row, ".//td")
@@ -237,21 +247,22 @@ parse_one_table <- function(tbl) {
       next
     }
 
-    cricinfo_ids <- c(cricinfo_ids, cricinfo_id)
-    names_vec <- c(names_vec, player_name)
-    maidens_vec <- c(maidens_vec, maidens_value)
+    output <- rbind(
+      output,
+      data.frame(
+        cricinfo_id = cricinfo_id,
+        name = player_name,
+        maidens = maidens_value,
+        stringsAsFactors = FALSE
+      )
+    )
   }
 
-  if (length(cricinfo_ids) == 0) {
+  if (nrow(output) == 0) {
     return(NULL)
   }
 
-  data.frame(
-    cricinfo_id = cricinfo_ids,
-    name = names_vec,
-    maidens = maidens_vec,
-    stringsAsFactors = FALSE
-  )
+  output
 }
 
 parse_stats_table <- function(html) {
@@ -279,106 +290,306 @@ parse_stats_table <- function(html) {
   )
 }
 
-extract_match_rows_for_format <- function(format_name, class_id, size = 200, max_pages = 20000, sleep_seconds = 0.15) {
+write_empty_raw_file <- function(format_name, worker_id) {
+  out <- data.frame(
+    cricinfo_id = character(),
+    name = character(),
+    maidens = integer(),
+    stringsAsFactors = FALSE
+  )
+
+  out_file <- file.path(
+    raw_dir,
+    paste0(format_name, "_maidens_raw_worker_", sprintf("%02d", worker_id), ".csv")
+  )
+
+  write.csv(out, out_file, row.names = FALSE, na = "")
+  out_file
+}
+
+run_worker_for_format <- function(format_name, class_id) {
   message("")
   message("====================================")
-  message("Extracting ", toupper(format_name), " match-by-match bowling maidens")
+  message("WORKER ", worker_id, " / ", total_workers)
+  message("Extracting ", toupper(format_name), " match pages")
   message("====================================")
 
   all_pages <- list()
+  empty_streak <- 0
 
-  for (page_num in seq_len(max_pages)) {
-    url <- build_url(class_id, page_num, size)
+  page_num <- worker_id
+
+  while (page_num <= max_pages) {
+    url <- build_url(class_id, page_num, page_size)
 
     html <- fetch_html(url)
     page_data <- parse_stats_table(html)
 
     if (nrow(page_data) == 0) {
-      message("[", format_name, "] no more rows found. Stopping.")
-      break
+      empty_streak <- empty_streak + 1
+
+      message(
+        "[", format_name, "] worker ",
+        worker_id,
+        " page ",
+        page_num,
+        " empty. Empty streak: ",
+        empty_streak
+      )
+
+      if (empty_streak >= empty_limit) {
+        message("[", format_name, "] worker ", worker_id, " stopping after empty streak.")
+        break
+      }
+
+      page_num <- page_num + total_workers
+      next
     }
+
+    empty_streak <- 0
+
+    page_data$source_page <- page_num
+    page_data$worker_id <- worker_id
+    page_data$format <- format_name
+    page_data$cricinfo_class <- class_id
 
     all_pages[[length(all_pages) + 1]] <- page_data
 
-    message("[", format_name, "] page ", page_num, " match rows: ", nrow(page_data))
+    message(
+      "[", format_name, "] worker ",
+      worker_id,
+      " page ",
+      page_num,
+      " rows: ",
+      nrow(page_data)
+    )
 
-    if (nrow(page_data) < size) {
-      message("[", format_name, "] final page reached.")
-      break
-    }
+    page_num <- page_num + total_workers
 
-    Sys.sleep(sleep_seconds)
+    Sys.sleep(1)
   }
 
   if (length(all_pages) == 0) {
-    stop("No match-by-match bowling rows extracted for: ", format_name)
+    out_file <- write_empty_raw_file(format_name, worker_id)
+    message("[", format_name, "] worker ", worker_id, " wrote empty file: ", out_file)
+    return(out_file)
   }
 
-  do.call(rbind, all_pages)
+  out <- do.call(rbind, all_pages)
+
+  out <- out[, c(
+    "cricinfo_id",
+    "name",
+    "maidens",
+    "source_page",
+    "worker_id",
+    "format",
+    "cricinfo_class"
+  )]
+
+  out_file <- file.path(
+    raw_dir,
+    paste0(format_name, "_maidens_raw_worker_", sprintf("%02d", worker_id), ".csv")
+  )
+
+  write.csv(out, out_file, row.names = FALSE, na = "")
+
+  message("[", format_name, "] worker ", worker_id, " saved raw rows: ", nrow(out))
+  message("[", format_name, "] raw file: ", out_file)
+
+  out_file
+}
+
+run_worker <- function() {
+  message("")
+  message("====================================")
+  message("STARTING WORKER MODE")
+  message("Worker ID: ", worker_id)
+  message("Total workers: ", total_workers)
+  message("Max pages: ", max_pages)
+  message("Page size: ", page_size)
+  message("Empty limit: ", empty_limit)
+  message("====================================")
+
+  made_files <- character()
+
+  for (i in seq_len(nrow(formats))) {
+    made <- run_worker_for_format(
+      format_name = formats$format[i],
+      class_id = formats$cricinfo_class[i]
+    )
+
+    made_files <- c(made_files, made)
+  }
+
+  message("")
+  message("WORKER DONE")
+  print(made_files)
 }
 
 aggregate_maidens_by_player <- function(match_rows) {
-  # Sum maidens by player ID.
-  summed <- aggregate(
-    maidens ~ cricinfo_id,
-    data = match_rows,
-    FUN = sum,
-    na.rm = TRUE
+  match_rows$cricinfo_id <- as.character(match_rows$cricinfo_id)
+  match_rows$name <- as.character(match_rows$name)
+  match_rows$maidens <- suppressWarnings(as.integer(match_rows$maidens))
+
+  unique_ids <- unique(match_rows$cricinfo_id)
+
+  output <- data.frame(
+    cricinfo_id = character(),
+    name = character(),
+    maidens = integer(),
+    stringsAsFactors = FALSE
   )
 
-  # Keep first name per ID.
-  first_names <- aggregate(
-    name ~ cricinfo_id,
-    data = match_rows,
-    FUN = function(x) x[1]
-  )
+  for (id in unique_ids) {
+    player_rows <- match_rows[match_rows$cricinfo_id == id, ]
 
-  output <- merge(summed, first_names, by = "cricinfo_id", all.x = TRUE)
+    player_name <- player_rows$name[1]
+    total_maidens <- sum(player_rows$maidens, na.rm = TRUE)
 
-  output <- output[, c("cricinfo_id", "name", "maidens")]
+    output <- rbind(
+      output,
+      data.frame(
+        cricinfo_id = id,
+        name = player_name,
+        maidens = total_maidens,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
 
   output <- output[order(-output$maidens, output$name), ]
 
-  row.names(output) <- NULL
-
-  output
+  output[, c("cricinfo_id", "name", "maidens")]
 }
 
-match_rows <- extract_match_rows_for_format(
-  format_name = format_name,
-  class_id = class_id,
-  size = 200,
-  max_pages = 20000,
-  sleep_seconds = 0.15
-)
+read_format_raw_files <- function(format_name) {
+  pattern <- paste0("^", format_name, "_maidens_raw_worker_[0-9]+\\.csv$")
 
-aggregated <- aggregate_maidens_by_player(match_rows)
+  files <- list.files(
+    artifact_dir,
+    pattern = pattern,
+    recursive = TRUE,
+    full.names = TRUE
+  )
 
-maidens_file <- file.path(output_dir, paste0(format_name, "_maidens.csv"))
-write.csv(aggregated, maidens_file, row.names = FALSE, na = "")
+  message("")
+  message("[", format_name, "] raw files found: ", length(files))
 
-report <- data.frame(
-  format = format_name,
-  cricinfo_class = class_id,
-  source_view = "match",
-  total_match_rows = nrow(match_rows),
-  unique_players = nrow(aggregated),
-  non_zero_maidens_players = sum(aggregated$maidens > 0, na.rm = TRUE),
-  zero_maidens_players = sum(aggregated$maidens == 0, na.rm = TRUE),
-  output_file = maidens_file,
-  stringsAsFactors = FALSE
-)
+  if (length(files) == 0) {
+    return(data.frame(
+      cricinfo_id = character(),
+      name = character(),
+      maidens = integer(),
+      stringsAsFactors = FALSE
+    ))
+  }
 
-report_file <- file.path(output_dir, paste0(format_name, "_maidens_report.csv"))
-write.csv(report, report_file, row.names = FALSE, na = "")
+  all_rows <- list()
 
-message("")
-message("====================================")
-message("DONE")
-message("====================================")
-message("Created files:")
-message("  ", maidens_file)
-message("  ", report_file)
-message("")
+  for (file in files) {
+    df <- read.csv(file, stringsAsFactors = FALSE)
 
-print(report)
+    if (nrow(df) == 0) {
+      next
+    }
+
+    if (!all(c("cricinfo_id", "name", "maidens") %in% names(df))) {
+      stop("Bad raw file columns in: ", file)
+    }
+
+    all_rows[[length(all_rows) + 1]] <- df
+  }
+
+  if (length(all_rows) == 0) {
+    return(data.frame(
+      cricinfo_id = character(),
+      name = character(),
+      maidens = integer(),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  do.call(rbind, all_rows)
+}
+
+run_merge <- function() {
+  message("")
+  message("====================================")
+  message("STARTING MERGE MODE")
+  message("Artifact directory: ", artifact_dir)
+  message("====================================")
+
+  all_reports <- list()
+
+  for (i in seq_len(nrow(formats))) {
+    format_name <- formats$format[i]
+    class_id <- formats$cricinfo_class[i]
+
+    raw_rows <- read_format_raw_files(format_name)
+
+    if (nrow(raw_rows) == 0) {
+      warning("No raw rows found for format: ", format_name)
+
+      aggregated <- data.frame(
+        cricinfo_id = character(),
+        name = character(),
+        maidens = integer(),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      aggregated <- aggregate_maidens_by_player(raw_rows)
+    }
+
+    maidens_file <- file.path(output_dir, paste0(format_name, "_maidens.csv"))
+    write.csv(aggregated, maidens_file, row.names = FALSE, na = "")
+
+    report_row <- data.frame(
+      format = format_name,
+      cricinfo_class = class_id,
+      source_view = "match",
+      total_match_rows = nrow(raw_rows),
+      unique_players = nrow(aggregated),
+      non_zero_maidens_players = sum(aggregated$maidens > 0, na.rm = TRUE),
+      zero_maidens_players = sum(aggregated$maidens == 0, na.rm = TRUE),
+      output_file = maidens_file,
+      stringsAsFactors = FALSE
+    )
+
+    all_reports[[length(all_reports) + 1]] <- report_row
+
+    message("")
+    message("[", format_name, "] saved final file: ", maidens_file)
+    message("[", format_name, "] total match rows: ", report_row$total_match_rows)
+    message("[", format_name, "] unique players: ", report_row$unique_players)
+    message("[", format_name, "] non-zero maiden players: ", report_row$non_zero_maidens_players)
+    message("[", format_name, "] zero maiden players: ", report_row$zero_maidens_players)
+  }
+
+  report <- do.call(rbind, all_reports)
+
+  report_file <- file.path(output_dir, "maidens_report.csv")
+  write.csv(report, report_file, row.names = FALSE, na = "")
+
+  message("")
+  message("====================================")
+  message("MERGE DONE")
+  message("====================================")
+  message("Created files:")
+  message("  ", file.path(output_dir, "test_maidens.csv"))
+  message("  ", file.path(output_dir, "odi_maidens.csv"))
+  message("  ", file.path(output_dir, "t20i_maidens.csv"))
+  message("  ", file.path(output_dir, "t20_maidens.csv"))
+  message("  ", report_file)
+  message("")
+
+  print(report)
+}
+
+if (mode == "worker") {
+  run_worker()
+} else if (mode == "merge") {
+  run_merge()
+} else {
+  stop("Unknown MODE. Use MODE=worker or MODE=merge.")
+}
