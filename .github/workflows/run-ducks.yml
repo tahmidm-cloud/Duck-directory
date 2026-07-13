@@ -1,11 +1,25 @@
-name: Extract ESPN Ducks
+name: Extract ESPN Maidens
 
 on:
   workflow_dispatch:
 
 jobs:
-  extract-ducks:
+  extract-maidens:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: test
+            class_id: 1
+          - format: odi
+            class_id: 2
+          - format: t20i
+            class_id: 3
+          - format: t20
+            class_id: 6
 
     steps:
       - name: Checkout repo
@@ -19,14 +33,19 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+          sudo apt-get install -y curl libxml2-dev
 
-      - name: Run ducks extractor
+      - name: Run maidens extractor
+        env:
+          FORMAT: ${{ matrix.format }}
+          CLASS_ID: ${{ matrix.class_id }}
         run: |
           Rscript extract_ducks.R
 
       - name: Upload CSV outputs
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: espn-ducks-output
+          name: espn-maidens-${{ matrix.format }}
           path: output/*.csv
+          if-no-files-found: warn
